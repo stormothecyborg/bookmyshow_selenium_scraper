@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -68,20 +69,9 @@ class BookMyShowScraper:
         self.page_load_timeout = page_load_timeout
         options = uc.ChromeOptions()
         if headless:
-            # NOTE: headless mode is itself an extra automation signal some
-            # bot-detection looks for. If you get blocked with --headless
-            # but NOT with a visible window, that's the reason -- try
-            # without it first while testing.
             options.add_argument("--headless=new")
         options.add_argument("--window-size=1366,900")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        # undetected-chromedriver auto-downloads a matching chromedriver,
-        # but it can pick a version newer than your installed Chrome
-        # (e.g. "ChromeDriver only supports Chrome version 153, current
-        # browser is 152") if a driver release is out ahead of a slightly
-        # older locally-installed Chrome. Pin the major version explicitly
-        # to avoid that mismatch -- pass your installed Chrome's major
-        # version number (Chrome menu -> Help -> About Google Chrome).
         self.driver = uc.Chrome(options=options, version_main=chrome_version_main)
         self.driver.set_page_load_timeout(page_load_timeout)
 
@@ -100,7 +90,6 @@ class BookMyShowScraper:
             return None
 
     def _check_for_block_page(self) -> bool:
-        """Detect a Cloudflare (or similar) interstitial/challenge page."""
         try:
             title = self.driver.title or ""
         except WebDriverException:
@@ -115,11 +104,6 @@ class BookMyShowScraper:
         return any(marker in body_text[:500] for marker in blocked_markers)
 
     def get_movies(self, city_slug: str, max_wait: int = 25) -> list[Movie]:
-        """
-        city_slug examples: 'bengaluru', 'mumbai', 'delhi-ncr', 'hyderabad'.
-        Matches BookMyShow's own URL slugs, e.g.
-        https://in.bookmyshow.com/explore/movies-bengaluru
-        """
         url = f"{BASE_URL}/explore/movies-{city_slug}"
         log.info("Opening %s", url)
 
@@ -132,8 +116,6 @@ class BookMyShowScraper:
             log.error("Browser error loading %s: %s", url, e)
             return []
 
-        # Give client-side rendering a moment, then check we weren't
-        # served a bot-detection challenge page instead of the real site.
         time.sleep(3)
         if self._check_for_block_page():
             log.error(
@@ -143,15 +125,8 @@ class BookMyShowScraper:
             )
             return []
 
-        # Movie cards on the explore page. BookMyShow's markup changes
-        # periodically; this targets anchors whose href contains '/movies/'
-        # rather than a specific class name, which is more resilient to
-        # theme/CSS changes (the same defensive approach used in the
-        # MDComputers scraper).
         self._wait_for(By.CSS_SELECTOR, "a[href*='/movies/']", timeout=max_wait)
 
-        # Scroll a few times to trigger lazy-loaded content (infinite
-        # scroll / "load more" patterns common on this kind of listing page).
         last_height = self.driver.execute_script("return document.body.scrollHeight")
         for _ in range(6):
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -170,8 +145,6 @@ class BookMyShowScraper:
                 href = card.get_attribute("href")
                 if not href or "/movies/" not in href:
                     continue
-                # Movie detail links look like .../movies/<city>/<slug>/<code>
-                # Use the href itself as the dedup key.
                 if href in movies:
                     continue
 
@@ -181,8 +154,6 @@ class BookMyShowScraper:
                     or None
                 )
                 if not title:
-                    # Some cards wrap an <img alt="Movie Title"> instead of
-                    # visible text.
                     try:
                         img = card.find_element(By.TAG_NAME, "img")
                         title = img.get_attribute("alt")
@@ -190,13 +161,173 @@ class BookMyShowScraper:
                         pass
 
                 if not title:
-                    continue  # nothing usable, skip rather than emit a blank row
+                    continue
 
                 movies[href] = Movie(title=title.strip(), url=href, city=city_slug)
             except WebDriverException:
                 continue
 
         return list(movies.values())
+
+    def get_movie_details(
+        self, movie: Movie, debug: bool = False, debug_dir: str = "debug"
+    ) -> Movie:
+        """
+        Visits a single movie's detail page and fills in language, genre,
+        censor_rating, votes_or_rating. Mutates and returns the same Movie.
+        """
+        if not movie.url:
+            log.warning("  -> skipping '%s': no URL", movie.title)
+            return movie
+
+        try:
+            self.driver.get(movie.url)
+        except TimeoutException:
+            log.warning("  -> timed out loading detail page for '%s'", movie.title)
+            return movie
+        except WebDriverException as e:
+            log.warning("  -> browser error loading detail page for '%s': %s", movie.title, e)
+            return movie
+
+        time.sleep(2)
+
+        page_title = ""
+        try:
+            page_title = self.driver.title or ""
+        except WebDriverException:
+            pass
+
+        if self._check_for_block_page():
+            log.warning(
+                "  -> BLOCKED on detail page for '%s' (page title: %r); skipping details.",
+                movie.title, page_title,
+            )
+            if debug:
+                self._dump_debug(movie, debug_dir, suffix="blocked")
+            return movie
+
+        log.info("  -> loaded detail page (title: %r)", page_title)
+
+        # --- Attempt 1: JSON-LD structured data ---
+        jsonld_found = 0
+        jsonld_movie_objs = 0
+        try:
+            scripts = self.driver.find_elements(
+                By.CSS_SELECTOR, "script[type='application/ld+json']"
+            )
+            jsonld_found = len(scripts)
+            for script in scripts:
+                raw = script.get_attribute("innerHTML")
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                candidates = data if isinstance(data, list) else [data]
+                if isinstance(data, dict) and "@graph" in data:
+                    candidates = data["@graph"]
+
+                for obj in candidates:
+                    if not isinstance(obj, dict):
+                        continue
+                    obj_type = obj.get("@type", "")
+                    if isinstance(obj_type, list):
+                        is_movie = "Movie" in obj_type
+                    else:
+                        is_movie = obj_type == "Movie"
+                    if not is_movie:
+                        continue
+
+                    jsonld_movie_objs += 1
+                    movie.genre = self._stringify(obj.get("genre")) or movie.genre
+                    movie.language = self._stringify(obj.get("inLanguage")) or movie.language
+                    movie.censor_rating = (
+                        obj.get("contentRating") or movie.censor_rating
+                    )
+                    rating = obj.get("aggregateRating")
+                    if isinstance(rating, dict):
+                        value = rating.get("ratingValue")
+                        count = rating.get("ratingCount") or rating.get("reviewCount")
+                        if value:
+                            movie.votes_or_rating = (
+                                f"{value} ({count} votes)" if count else str(value)
+                            )
+                    break
+        except WebDriverException as e:
+            log.warning("  -> WebDriverException while reading JSON-LD: %s", e)
+
+        log.info(
+            "  -> JSON-LD: %d <script> tag(s) found, %d parsed as an object with @type Movie",
+            jsonld_found, jsonld_movie_objs,
+        )
+
+        # --- Attempt 2: fallback DOM/text scan, only for fields still missing ---
+        used_fallback = False
+        if not (movie.genre and movie.language and movie.censor_rating):
+            used_fallback = True
+            try:
+                body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            except (NoSuchElementException, WebDriverException):
+                body_text = ""
+
+            log.info("  -> fallback text scan: body_text length = %d chars", len(body_text))
+
+            if not movie.censor_rating:
+                match = re.search(
+                    r"\b(U/?A\s?\d*\+?|U|A|S)\b(?=\s|$)", body_text[:3000]
+                )
+                if match:
+                    movie.censor_rating = match.group(1)
+
+            if not movie.language:
+                known_languages = [
+                    "Hindi", "English", "Tamil", "Telugu", "Kannada",
+                    "Malayalam", "Marathi", "Bengali", "Punjabi", "Gujarati",
+                ]
+                found = [lang for lang in known_languages if lang in body_text[:3000]]
+                if found:
+                    movie.language = ", ".join(found)
+
+        log.info(
+            "  -> result for '%s': language=%r genre=%r censor_rating=%r votes_or_rating=%r",
+            movie.title, movie.language, movie.genre, movie.censor_rating, movie.votes_or_rating,
+        )
+
+        # If we still got nothing at all after both attempts, this movie's
+        # page is worth inspecting by hand -- dump it if --debug was passed.
+        if debug and not (movie.language or movie.genre or movie.censor_rating or movie.votes_or_rating):
+            self._dump_debug(movie, debug_dir, suffix="empty", note=f"jsonld_scripts={jsonld_found} used_fallback={used_fallback}")
+
+        return movie
+
+    def _dump_debug(self, movie: Movie, debug_dir: str, suffix: str, note: str = "") -> None:
+        """Save the current page's HTML + a screenshot to disk so the actual
+        rendered page can be inspected by hand. Only called with --debug."""
+        import os
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", movie.title or "untitled")[:60]
+        html_path = os.path.join(debug_dir, f"{safe_name}_{suffix}.html")
+        png_path = os.path.join(debug_dir, f"{safe_name}_{suffix}.png")
+        try:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+        except (WebDriverException, OSError) as e:
+            log.warning("  -> could not save debug HTML for '%s': %s", movie.title, e)
+        try:
+            self.driver.save_screenshot(png_path)
+        except (WebDriverException, OSError) as e:
+            log.warning("  -> could not save debug screenshot for '%s': %s", movie.title, e)
+        log.info("  -> DEBUG dump saved: %s / %s %s", html_path, png_path, f"({note})" if note else "")
+
+    @staticmethod
+    def _stringify(value) -> Optional[str]:
+        if not value:
+            return None
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value if v)
+        return str(value)
 
 
 def save_csv(movies: list[Movie], path: str) -> None:
@@ -243,6 +374,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "yours via Chrome menu -> Help -> About Google Chrome."
         ),
     )
+    parser.add_argument(
+        "--details", action="store_true",
+        help=(
+            "Also visit each movie's own page to fill in language, genre, "
+            "censor rating, and rating/votes. Slower -- one extra page "
+            "load per movie -- so it's opt-in."
+        ),
+    )
+    parser.add_argument(
+        "--detail-delay", type=float, default=1.5,
+        help="Seconds to pause between detail-page visits (default 1.5, be polite).",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help=(
+            "When --details finds nothing for a movie (or hits a block page), "
+            "save that page's HTML + a screenshot into ./debug/ so you can "
+            "see exactly what the browser was looking at."
+        ),
+    )
+    parser.add_argument(
+        "--debug-dir", default="debug",
+        help="Directory to write --debug HTML/screenshot dumps to (default: ./debug).",
+    )
     return parser
 
 
@@ -253,6 +408,14 @@ def main() -> int:
     scraper = BookMyShowScraper(headless=args.headless, chrome_version_main=args.chrome_version)
     try:
         movies = scraper.get_movies(args.city, max_wait=args.wait)
+
+        if movies and args.details:
+            log.info("Fetching details for %d movies (this takes a while)...", len(movies))
+            for i, movie in enumerate(movies, start=1):
+                log.info("[%d/%d] %s", i, len(movies), movie.title)
+                scraper.get_movie_details(movie, debug=args.debug, debug_dir=args.debug_dir)
+                if i < len(movies):
+                    time.sleep(args.detail_delay)
     finally:
         scraper.close()
 
